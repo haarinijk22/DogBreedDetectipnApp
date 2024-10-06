@@ -5,71 +5,78 @@ from PIL import Image
 import torchvision.transforms as transforms
 import requests
 import gradio as gr
+import os
 
 # Load pretrained VGG16 model
-VGG16 = models.vgg16(pretrained=True)
+VGG16 = models.vgg16(weights="IMAGENET1K_V1")
 use_cuda = torch.cuda.is_available()
 if use_cuda:
     VGG16 = VGG16.cuda()
 
+# Global cache for labels
+LABELS_CACHE = None
+
+def prefetch_labels():
+    global LABELS_CACHE
+    LABELS_MAP_URL = "https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json"
+    try:
+        LABELS_CACHE = requests.get(LABELS_MAP_URL, timeout=5).json()
+    except requests.exceptions.RequestException as e:
+        LABELS_CACHE = None
+        print(f"Error fetching labels: {e}")
+
+# Fetch labels on startup
+prefetch_labels()
+
 def load_convert_image_to_tensor(image):
-    # Check if the input is a NumPy array (Gradio may pass it as NumPy)
     if isinstance(image, np.ndarray):
         image = Image.fromarray(image.astype('uint8'), 'RGB')
     elif isinstance(image, str):
-        image = Image.open(image).convert('RGB')  # If it's a path, load the image
+        image = Image.open(image).convert('RGB')
     
     in_transform = transforms.Compose([
-        transforms.Resize(size=(224, 224)),  # Correct input size for VGG16
+        transforms.Resize(size=(224, 224)),
         transforms.ToTensor()
     ]) 
     image = in_transform(image)[:3, :, :].unsqueeze(0)
     return image
 
-def get_human_readable_label_for_class_id(class_id):
-    LABELS_MAP_URL = "https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json"
-    labels = requests.get(LABELS_MAP_URL).json()
-    return labels[class_id]
+def get_human_readable_label_for_class_id(class_id, labels_cache=None):
+    if labels_cache is None or class_id >= len(labels_cache):
+        return f"Unknown class ID: {class_id}"
+    return labels_cache[class_id]
 
-def classify_image(image):
+def classify_image(image, confidence_threshold=0.0):
+    global LABELS_CACHE
+    if LABELS_CACHE is None:
+        return "Error: Labels not loaded"
+
     try:
         image_tensor = load_convert_image_to_tensor(image)
         if use_cuda:
             image_tensor = image_tensor.cuda()
 
         output = VGG16(image_tensor)
-        _, preds_tensor = torch.max(output, 1)
-        pred = np.squeeze(preds_tensor.cpu().numpy()) if use_cuda else np.squeeze(preds_tensor.numpy())
-        class_description = get_human_readable_label_for_class_id(int(pred))
-        return class_description
+        softmax_output = torch.nn.functional.softmax(output, dim=1)
+        top_probs, top_classes = torch.topk(softmax_output, 3)
+        top_probs = top_probs.cpu().detach().numpy() if use_cuda else top_probs.detach().numpy()
+        top_classes = top_classes.cpu().detach().numpy() if use_cuda else top_classes.detach().numpy()
+
+        result = {}
+        for prob, cls_id in zip(top_probs[0], top_classes[0]):
+            if prob >= confidence_threshold:
+                label = get_human_readable_label_for_class_id(int(cls_id), LABELS_CACHE)
+                result[label] = prob
+        return result if result else "No predictions above the confidence threshold."
     except Exception as e:
-        # If there's any error, return the error message for debugging
         return f"Error: {str(e)}"
 
-# Adding the Disclaimer
-disclaimer_text = "Disclaimer: Predictions are based on VGG16 model accuracy and may not be 100% accurate."
-
 # Gradio Interface
-def create_interface():
-    # Gradio Interface
-    image_input = gr.Image(label="Upload an Image")
-    label_output = gr.Label(num_top_classes=1)
-    disclaimer_output = gr.Markdown(disclaimer_text)
+image_input = gr.Image()
+confidence_slider = gr.Slider(minimum=0, maximum=1, default=0.0, label="Confidence Threshold (Optional)")
+label_output = gr.Label(num_top_classes=3)
 
-    # Interface Layout
-    interface = gr.Blocks()  # Using Blocks for custom layout
+interface = gr.Interface(fn=classify_image, inputs=[image_input, confidence_slider], outputs=label_output)
 
-    with interface:
-        gr.Markdown("# Dog Breed Identification")
-        gr.Markdown("This tool uses a VGG16 model to predict the dog breed based on the uploaded image.")
-        with gr.Row():
-            with gr.Column():
-                image_input.render()  # Input on the left
-            with gr.Column():
-                label_output.render()  # Output on the right
-        disclaimer_output.render()  # Disclaimer at the bottom
-
-    return interface
-
-# Launch the interface
-create_interface().launch()
+# Launch Gradio with shareable link
+interface.launch(share=True)
